@@ -1,0 +1,321 @@
+```cpp
+#include <Arduino.h>
+
+// ==========================================
+// SMART DRAIN MONITOR - ESP32
+// ==========================================
+
+// Pin configuration
+const uint8_t TRIG_PIN = 5;
+const uint8_t ECHO_PIN = 18;
+
+const uint8_t GREEN_LED = 25;
+const uint8_t RED_LED = 26;
+const uint8_t BUZZER_PIN = 19;
+
+const uint8_t FLOW_SENSOR_PIN = 27;
+
+// ==========================================
+// CONFIGURATION
+// ==========================================
+
+// Measure the actual sensor-to-container-bottom distance.
+const float SENSOR_HEIGHT_CM = 20.0f;
+
+// Water-level thresholds
+const float WARNING_LEVEL = 50.0f;
+const float CRITICAL_LEVEL = 75.0f;
+
+// Example calibration for a common flow sensor.
+// Verify against your actual model.
+const float PULSES_PER_LITRE = 450.0f;
+
+// Example threshold; calibrate before relying on it.
+const float LOW_FLOW_LPM = 0.5f;
+
+// Timing
+const unsigned long SENSOR_INTERVAL_MS = 1000;
+const unsigned long FLOW_INTERVAL_MS = 5000;
+
+// ==========================================
+// VARIABLES
+// ==========================================
+
+volatile unsigned long flowPulses = 0;
+
+unsigned long lastSensorTime = 0;
+unsigned long lastFlowTime = 0;
+
+float distanceCm = 0.0f;
+float waterLevelPercent = 0.0f;
+float flowRateLPM = 0.0f;
+
+bool sensorValid = false;
+
+enum DrainStatus {
+  NORMAL,
+  WARNING,
+  CRITICAL,
+  SENSOR_ERROR
+};
+
+DrainStatus status = SENSOR_ERROR;
+
+// ==========================================
+// FLOW SENSOR INTERRUPT
+// ==========================================
+
+void IRAM_ATTR flowPulseISR() {
+  flowPulses++;
+}
+
+// ==========================================
+// ULTRASONIC SENSOR
+// ==========================================
+
+bool readDistance(float &distance) {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration =
+      pulseIn(ECHO_PIN, HIGH, 30000UL);
+
+  if (duration == 0) {
+    return false;
+  }
+
+  distance = duration * 0.0343f / 2.0f;
+
+  // HC-SR04 nominal measuring range
+  if (distance < 2.0f || distance > 400.0f) {
+    return false;
+  }
+
+  return true;
+}
+
+// ==========================================
+// WATER LEVEL
+// ==========================================
+
+float calculateWaterLevel(float distance) {
+  float level =
+      ((SENSOR_HEIGHT_CM - distance) /
+       SENSOR_HEIGHT_CM) * 100.0f;
+
+  return constrain(level, 0.0f, 100.0f);
+}
+
+// ==========================================
+// FLOW RATE
+// ==========================================
+
+void updateFlowRate() {
+  unsigned long now = millis();
+
+  if (now - lastFlowTime < FLOW_INTERVAL_MS) {
+    return;
+  }
+
+  unsigned long elapsedMs = now - lastFlowTime;
+  lastFlowTime = now;
+
+  noInterrupts();
+  unsigned long pulses = flowPulses;
+  flowPulses = 0;
+  interrupts();
+
+  float litres = pulses / PULSES_PER_LITRE;
+  float elapsedMinutes = elapsedMs / 60000.0f;
+
+  if (elapsedMinutes > 0.0f) {
+    flowRateLPM = litres / elapsedMinutes;
+  }
+}
+
+// ==========================================
+// STATUS LOGIC
+// ==========================================
+
+void updateStatus() {
+  if (!sensorValid) {
+    status = SENSOR_ERROR;
+  }
+  else if (waterLevelPercent >= CRITICAL_LEVEL) {
+    status = CRITICAL;
+  }
+  else if (waterLevelPercent >= WARNING_LEVEL) {
+    status = WARNING;
+  }
+  else {
+    status = NORMAL;
+  }
+}
+
+// ==========================================
+// LED AND BUZZER CONTROL
+// ==========================================
+
+void updateOutputs() {
+  switch (status) {
+
+    case NORMAL:
+      digitalWrite(GREEN_LED, HIGH);
+      digitalWrite(RED_LED, LOW);
+      digitalWrite(BUZZER_PIN, LOW);
+      break;
+
+    case WARNING:
+      digitalWrite(GREEN_LED, LOW);
+      digitalWrite(RED_LED, HIGH);
+
+      // Intermittent warning beeps
+      digitalWrite(
+        BUZZER_PIN,
+        ((millis() / 400) % 2) ? HIGH : LOW
+      );
+      break;
+
+    case CRITICAL:
+      digitalWrite(GREEN_LED, LOW);
+      digitalWrite(RED_LED, HIGH);
+
+      // Rapid critical beeps
+      digitalWrite(
+        BUZZER_PIN,
+        ((millis() / 150) % 2) ? HIGH : LOW
+      );
+      break;
+
+    case SENSOR_ERROR:
+      digitalWrite(GREEN_LED, LOW);
+      digitalWrite(RED_LED, LOW);
+      digitalWrite(BUZZER_PIN, LOW);
+      break;
+  }
+}
+
+// ==========================================
+// SERIAL MONITOR
+// ==========================================
+
+void printReadings() {
+  Serial.println();
+  Serial.println("===== SMARTDRAIN MONITOR =====");
+
+  if (!sensorValid) {
+    Serial.println("STATUS: SENSOR ERROR");
+    Serial.println("Check ultrasonic wiring.");
+  }
+  else {
+    Serial.print("Drain ID: DRAIN-001\n");
+
+    Serial.print("Distance: ");
+    Serial.print(distanceCm, 1);
+    Serial.println(" cm");
+
+    Serial.print("Water Level: ");
+    Serial.print(waterLevelPercent, 1);
+    Serial.println("%");
+
+    Serial.print("Flow Rate: ");
+    Serial.print(flowRateLPM, 2);
+    Serial.println(" L/min");
+
+    switch (status) {
+      case NORMAL:
+        Serial.println("STATUS: NORMAL");
+        break;
+
+      case WARNING:
+        Serial.println("STATUS: WARNING - Water rising");
+        break;
+
+      case CRITICAL:
+        Serial.println("STATUS: CRITICAL - High water level");
+        break;
+
+      default:
+        break;
+    }
+
+    if (waterLevelPercent >= WARNING_LEVEL &&
+        flowRateLPM < LOW_FLOW_LPM) {
+      Serial.println(
+        "NOTICE: High water and low measured flow."
+      );
+      Serial.println(
+        "Possible blockage; further inspection required."
+      );
+    }
+  }
+
+  Serial.println("==============================");
+}
+
+// ==========================================
+// SETUP
+// ==========================================
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  pinMode(FLOW_SENSOR_PIN, INPUT_PULLUP);
+
+  attachInterrupt(
+    digitalPinToInterrupt(FLOW_SENSOR_PIN),
+    flowPulseISR,
+    FALLING
+  );
+
+  digitalWrite(TRIG_PIN, LOW);
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  lastSensorTime = millis();
+  lastFlowTime = millis();
+
+  Serial.println("SmartDrain Monitor Started");
+  Serial.println("Mode: Local hardware prototype");
+}
+
+// ==========================================
+// MAIN LOOP
+// ==========================================
+
+void loop() {
+  unsigned long now = millis();
+
+  updateFlowRate();
+  updateOutputs();
+
+  if (now - lastSensorTime >= SENSOR_INTERVAL_MS) {
+    lastSensorTime = now;
+
+    sensorValid = readDistance(distanceCm);
+
+    if (sensorValid) {
+      waterLevelPercent =
+          calculateWaterLevel(distanceCm);
+    }
+
+    updateStatus();
+    printReadings();
+  }
+
+  updateOutputs();
+}
+```
